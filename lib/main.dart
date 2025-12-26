@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_mlkit_digital_ink_recognition/google_mlkit_digital_ink_recognition.dart'
@@ -10,7 +11,9 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:open_filex/open_filex.dart';
-import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:flutter_sound/flutter_sound.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const MyApp());
@@ -32,6 +35,7 @@ class MyApp extends StatelessWidget {
         '/write': (_) => const HandwritingPage(title: 'Write in Devanagari'),
         '/recognitions': (_) => const RecognitionsPage(),
         '/mode': (_) => const ModeSelectPage(),
+        '/voice': (_) => const VoiceModePage(),
         '/qp/setup': (_) => const QuestionPaperSetupPage(),
       },
     );
@@ -357,6 +361,14 @@ class ModeSelectPage extends StatelessWidget {
               subtitle: 'See all recognized results',
               color: scheme.secondaryContainer,
               onTap: () => Navigator.of(context).pushNamed('/recognitions'),
+            ),
+            const SizedBox(height: 12),
+            _ModeTile(
+              icon: Icons.mic,
+              title: 'Voice Mode',
+              subtitle: 'Use voice input',
+              color: scheme.errorContainer,
+              onTap: () => Navigator.of(context).pushNamed('/voice'),
             ),
             const SizedBox(height: 12),
             _ModeTile(
@@ -766,9 +778,9 @@ class _QuestionPaperSummaryPageState extends State<QuestionPaperSummaryPage> {
             const Divider(),
             ListTile(
               leading: const Icon(Icons.description, color: Colors.blue),
-              title: const Text('Document (DOC)'),
+              title: const Text('Document (RTF)'),
               subtitle: const Text('Editable format, can be opened in Word/Google Docs'),
-              onTap: () => Navigator.of(context).pop('doc'),
+              onTap: () => Navigator.of(context).pop('rtf'),
             ),
           ],
         ),
@@ -784,8 +796,8 @@ class _QuestionPaperSummaryPageState extends State<QuestionPaperSummaryPage> {
     if (selectedFormat != null) {
       if (selectedFormat == 'pdf') {
         await _downloadPaperAsPdf();
-      } else if (selectedFormat == 'doc') {
-        await _downloadPaperAsDoc();
+      } else if (selectedFormat == 'rtf') {
+        await _downloadPaperAsRtf();
       }
     }
   }
@@ -822,7 +834,7 @@ class _QuestionPaperSummaryPageState extends State<QuestionPaperSummaryPage> {
     return buffer.toString();
   }
 
-  String _generateDocContent() {
+  String _generateRtfContent() {
     final Map<int, String> byQ = _getQuestionsMap();
     final StringBuffer rtf = StringBuffer();
     
@@ -884,17 +896,18 @@ class _QuestionPaperSummaryPageState extends State<QuestionPaperSummaryPage> {
     return rtf.toString();
   }
 
-  Future<void> _downloadPaperAsDoc() async {
+  Future<void> _downloadPaperAsRtf() async {
     _showLoadingDialog('Generating Document...');
     try {
-      final String docContent = _generateDocContent();
+      final String rtfContent = _generateRtfContent();
       
-      // Save DOC document to file
+      // Save RTF document to file (RTF files are typically Windows-1252, but we'll use UTF-8)
       final Directory directory = await getApplicationDocumentsDirectory();
-      final String fileName = 'question_paper_${DateTime.now().millisecondsSinceEpoch}.doc';
+      final String fileName = 'question_paper_${DateTime.now().millisecondsSinceEpoch}.rtf';
       final String filePath = '${directory.path}/$fileName';
       final File file = File(filePath);
-      await file.writeAsString(docContent, encoding: utf8);
+      // Write as UTF-8 - modern word processors handle this correctly
+      await file.writeAsString(rtfContent, encoding: utf8);
       
       // Close loading dialog
       if (mounted) {
@@ -1354,15 +1367,9 @@ class _QuestionPaneState extends State<_QuestionPane> {
   final GlobalKey<_HandwritingCanvasState> _canvasKey = GlobalKey<_HandwritingCanvasState>();
   String _result = '';
   List<String> _candidates = <String>[];
-  late stt.SpeechToText _speech;
-  bool _isListening = false;
-  String _speechText = '';
 
   @override
-  void initState() {
-    super.initState();
-    _speech = stt.SpeechToText();
-  }
+  Widget build(BuildContext context) {
     return Column(
       children: <Widget>[
         Expanded(child: HandwritingCanvas(key: _canvasKey)),
@@ -1941,6 +1948,221 @@ class _QuestionAnswerViewPageState extends State<QuestionAnswerViewPage> {
                 ),
               ],
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------
+// Voice Mode Page
+// ---------------------------
+
+class VoiceModePage extends StatefulWidget {
+  const VoiceModePage({super.key});
+
+  @override
+  State<VoiceModePage> createState() => _VoiceModePageState();
+}
+
+class _VoiceModePageState extends State<VoiceModePage> {
+  FlutterSoundRecorder? _recorder;
+  bool _isRecording = false;
+  String _recognizedText = '';
+  bool _isProcessing = false;
+  Timer? _chunkTimer;
+  int _chunkCount = 0;
+
+  static const String _apiEndpoint = 'https://morainal-delena-unvaccinated.ngrok-free.dev/transcribe';
+  static const int _chunkDurationSeconds = 3;
+
+  @override
+  void initState() {
+    super.initState();
+    _initRecorder();
+  }
+
+  Future<void> _initRecorder() async {
+    _recorder = FlutterSoundRecorder();
+    await _recorder!.openRecorder();
+  }
+
+  @override
+  void dispose() {
+    _chunkTimer?.cancel();
+    _recorder?.closeRecorder();
+    super.dispose();
+  }
+
+  Future<void> _toggleRecording() async {
+    if (_isRecording) {
+      await _stopRecording();
+    } else {
+      await _startRecording();
+    }
+  }
+
+  Future<void> _startRecording() async {
+    try {
+      final status = await Permission.microphone.request();
+      if (status != PermissionStatus.granted) {
+        throw Exception('Microphone permission denied');
+      }
+
+      setState(() {
+        _isRecording = true;
+        _recognizedText = '';
+        _chunkCount = 0;
+      });
+      
+      _startChunkRecording();
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Recording failed: $e')),
+      );
+    }
+  }
+
+  Future<void> _startChunkRecording() async {
+    if (!_isRecording) return;
+    
+    final Directory tempDir = await getTemporaryDirectory();
+    final String audioPath = '${tempDir.path}/chunk_${_chunkCount}_${DateTime.now().millisecondsSinceEpoch}.wav';
+    
+    await _recorder!.startRecorder(
+      toFile: audioPath,
+      codec: Codec.pcm16WAV,
+      sampleRate: 16000,
+    );
+    
+    _chunkTimer = Timer(Duration(seconds: _chunkDurationSeconds), () async {
+      if (_isRecording) {
+        await _recorder!.stopRecorder();
+        _chunkCount++;
+        _sendAudioToAPI(audioPath);
+        _startChunkRecording(); // Start next chunk
+      }
+    });
+  }
+
+  Future<void> _stopRecording() async {
+    setState(() {
+      _isRecording = false;
+    });
+    
+    _chunkTimer?.cancel();
+    await _recorder!.stopRecorder();
+  }
+
+  Future<void> _sendAudioToAPI(String audioPath) async {
+    try {
+      final File audioFile = File(audioPath);
+      if (!await audioFile.exists()) return;
+
+      final request = http.MultipartRequest('POST', Uri.parse(_apiEndpoint));
+      request.headers['ngrok-skip-browser-warning'] = 'true';
+      request.files.add(
+        http.MultipartFile(
+          'file',
+          audioFile.readAsBytes().asStream(),
+          await audioFile.length(),
+          filename: 'chunk.wav',
+        ),
+      );
+      
+      final response = await request.send();
+      final responseBody = await response.stream.bytesToString();
+      
+      if (response.statusCode == 200) {
+        final Map<String, dynamic> result = json.decode(responseBody);
+        final String recognizedText = result['transcription'] ?? 'No text recognized';
+        
+        if (recognizedText.isNotEmpty && recognizedText != 'No text recognized') {
+          setState(() {
+            _recognizedText += '$recognizedText ';
+          });
+          RecognitionsStore.instance.add(recognizedText);
+        }
+      }
+    } catch (e) {
+      print('Chunk processing error: $e');
+    } finally {
+      try {
+        await File(audioPath).delete();
+      } catch (_) {}
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Voice Mode'),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            Container(
+              width: 200,
+              height: 200,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _isRecording ? Colors.red.shade100 : Colors.blue.shade100,
+                border: Border.all(
+                  color: _isRecording ? Colors.red : Colors.blue,
+                  width: 4,
+                ),
+              ),
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(100),
+                  onTap: _toggleRecording,
+                  child: Center(
+                    child: Icon(
+                      _isRecording ? Icons.stop : Icons.mic,
+                      size: 80,
+                      color: _isRecording ? Colors.red : Colors.blue,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 32),
+            Text(
+              _isRecording
+                  ? 'Recording live... Tap to stop'
+                  : 'Tap to start live recording',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 24),
+            if (_recognizedText.isNotEmpty)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.grey.shade300),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Text(
+                      'Recognized Text:',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      _recognizedText,
+                      style: const TextStyle(fontSize: 16),
+                    ),
+                  ],
+                ),
+              ),
           ],
         ),
       ),
